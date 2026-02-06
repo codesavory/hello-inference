@@ -14,26 +14,42 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 MAX_BYTES = 10 * 1024 * 1024
-VIDEO_DIR = "/video-store"
+VIDEO_DIR = "/vfi-video-store"
 MODEL_DIR = "/vfi-models"
 ATM_VFI_DIR = "/atm-vfi"
 DEFAULT_CHECKPOINT_NAME = "atm-vfi.ckpt"
 
-volume = modal.Volume.from_name("styleframe-inference-storage", create_if_missing=True)
-model_volume = modal.Volume.from_name("styleframe-vfi-models", create_if_missing=True)
+video_volume = modal.Volume.from_name(
+    "styleframe-vfi-storage",
+    create_if_missing=True,
+)
+model_volume = modal.Volume.from_name(
+    "styleframe-vfi-models",
+    create_if_missing=True,
+)
+
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "git", "libgl1", "libglib2.0-0")
+    .apt_install(
+        "ffmpeg",
+        "git",
+        "libgl1",
+        "libglib2.0-0",
+        "zlib1g-dev",
+        "libjpeg-dev",
+    )
     .run_commands(
         "python -m pip install --upgrade pip",
         "git clone --depth 1 https://github.com/Gancheekim/ATM-VFI.git /atm-vfi",
         "pip install --no-cache-dir fastapi>=0.115.0 python-multipart>=0.0.9",
+        "pip install --no-cache-dir timm",
+        "pip install --no-cache-dir einops",
         "pip install --no-cache-dir -r /atm-vfi/requirements.txt "
         "--extra-index-url https://download.pytorch.org/whl/cu118",
     )
 )
 
-app = modal.App("styleframe-transcoder", image=image)
+app = modal.App("styleframe-atm-vfi", image=image)
 web_app = FastAPI()
 
 allowed_origins = [
@@ -109,39 +125,6 @@ def _probe_video(path: Path) -> dict[str, Any]:
     }
 
 
-def _transcode(input_path: Path, output_path: Path) -> None:
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-vf",
-        "format=gray",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Transcode failed: {result.stderr[-400:]}",
-        )
-
-
 def _resolve_checkpoint(name: str | None) -> Path:
     checkpoint_name = name or DEFAULT_CHECKPOINT_NAME
     path = Path(MODEL_DIR) / checkpoint_name
@@ -197,44 +180,45 @@ def _run_atm_vfi(
         )
 
 
-@web_app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
-    if file.content_type and not file.content_type.startswith("video/"):
+def _run_atm_vfi_frames(
+    frame0_path: Path,
+    frame1_path: Path,
+    output_path: Path,
+    model_type: str,
+    checkpoint_path: Path,
+) -> None:
+    cmd = [
+        "python",
+        str(Path(ATM_VFI_DIR) / "demo_2x.py"),
+        "--model_type",
+        model_type,
+        "--ckpt",
+        str(checkpoint_path),
+        "--frame0",
+        str(frame0_path),
+        "--frame1",
+        str(frame1_path),
+        "--out",
+        str(output_path),
+    ]
+
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{ATM_VFI_DIR}{os.pathsep}{existing}" if existing else ATM_VFI_DIR
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=ATM_VFI_DIR,
+        env=env,
+    )
+    if result.returncode != 0:
+        detail = result.stderr[-400:] or "ATM-VFI failed"
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only video uploads are supported.",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=detail,
         )
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        input_path = Path(temp_dir) / "input"
-        size = 0
-        with input_path.open("wb") as handle:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_BYTES:
-                    raise HTTPException(
-                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        detail="File exceeds 10MB limit.",
-                    )
-                handle.write(chunk)
-
-        metadata = _probe_video(input_path)
-        video_id = uuid.uuid4().hex
-        output_path = Path(VIDEO_DIR) / f"{video_id}.mp4"
-        _transcode(input_path, output_path)
-        try:
-            input_path.unlink()
-        except FileNotFoundError:
-            pass
-        volume.commit()
-
-    return {
-        "id": video_id,
-        "metadata": metadata,
-    }
 
 
 @web_app.post("/vfi/checkpoints")
@@ -306,12 +290,68 @@ async def interpolate(
             combine_flag,
         )
         metadata = _probe_video(output_path)
-        volume.commit()
+        video_volume.commit()
 
     return {
         "id": video_id,
         "metadata": metadata,
     }
+
+
+@web_app.post("/vfi/interpolate-frames")
+async def interpolate_frames(
+    frame0: UploadFile = File(...),
+    frame1: UploadFile = File(...),
+    model_type: str = Form("base"),
+    checkpoint: str | None = Form(None),
+):
+    for frame in (frame0, frame1):
+        if frame.content_type and not frame.content_type.startswith("image/"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only image uploads are supported for frames.",
+            )
+
+    normalized_type = model_type.strip().lower()
+    if normalized_type not in {"base", "lite"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="model_type must be 'base' or 'lite'.",
+        )
+
+    checkpoint_path = _resolve_checkpoint(checkpoint)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_root = Path(temp_dir)
+        frame0_path = temp_root / (Path(frame0.filename).name or "frame0.png")
+        frame1_path = temp_root / (Path(frame1.filename).name or "frame1.png")
+
+        with frame0_path.open("wb") as handle:
+            while True:
+                chunk = await frame0.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+
+        with frame1_path.open("wb") as handle:
+            while True:
+                chunk = await frame1.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+
+        frame_id = uuid.uuid4().hex
+        output_path = Path(VIDEO_DIR) / f"{frame_id}.png"
+        _run_atm_vfi_frames(
+            frame0_path,
+            frame1_path,
+            output_path,
+            normalized_type,
+            checkpoint_path,
+        )
+        video_volume.commit()
+
+    return {"id": frame_id}
 
 
 @web_app.get("/video/{video_id}")
@@ -322,12 +362,23 @@ async def fetch_video(video_id: str):
     return StreamingResponse(path.open("rb"), media_type="video/mp4")
 
 
+@web_app.get("/frame/{frame_id}")
+async def fetch_frame(frame_id: str):
+    path = Path(VIDEO_DIR) / f"{frame_id}.png"
+    if not path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return StreamingResponse(path.open("rb"), media_type="image/png")
+
+
 @web_app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-@app.function(gpu="A10G", volumes={VIDEO_DIR: volume, MODEL_DIR: model_volume})
+@app.function(
+    gpu="A10G",
+    volumes={VIDEO_DIR: video_volume, MODEL_DIR: model_volume},
+)
 @modal.asgi_app()
 def fastapi_app():
     return web_app

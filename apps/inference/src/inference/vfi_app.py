@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 MAX_BYTES = 10 * 1024 * 1024
+MAX_MULTIPLIER = 8
 VIDEO_DIR = "/vfi-video-store"
 MODEL_DIR = "/vfi-models"
 ATM_VFI_DIR = "/atm-vfi"
@@ -82,7 +84,7 @@ def _probe_video(path: Path) -> dict[str, Any]:
     cmd = [
         "ffprobe",
         "-v",
-        "quiet",
+        "error",
         "-print_format",
         "json",
         "-show_streams",
@@ -92,6 +94,12 @@ def _probe_video(path: Path) -> dict[str, Any]:
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or exc.stdout.strip() or "ffprobe failed"
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=detail,
+        ) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -139,6 +147,25 @@ def _resolve_checkpoint(name: str | None) -> Path:
     return path
 
 
+def _validate_multiplier(value: int) -> int:
+    if value < 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="multiplier must be >= 2.",
+        )
+    if value > MAX_MULTIPLIER:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"multiplier must be <= {MAX_MULTIPLIER}.",
+        )
+    if value & (value - 1) != 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="multiplier must be a power of two (2, 4, 8, ...).",
+        )
+    return value
+
+
 def _run_atm_vfi(
     input_path: Path,
     output_path: Path,
@@ -174,6 +201,16 @@ def _run_atm_vfi(
     )
     if result.returncode != 0:
         detail = result.stderr[-400:] or "ATM-VFI failed"
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=detail,
+        )
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        stdout_tail = (result.stdout or "")[-400:]
+        stderr_tail = (result.stderr or "")[-400:]
+        detail = "ATM-VFI produced no output."
+        if stdout_tail or stderr_tail:
+            detail = f"{detail} stdout: {stdout_tail} stderr: {stderr_tail}"
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=detail,
@@ -247,6 +284,7 @@ async def interpolate(
     model_type: str = Form("base"),
     checkpoint: str | None = Form(None),
     combine_video: str = Form("false"),
+    multiplier: int = Form(2),
 ):
     if file.content_type and not file.content_type.startswith("video/"):
         raise HTTPException(
@@ -263,6 +301,7 @@ async def interpolate(
 
     combine_flag = combine_video.strip().lower() in {"1", "true", "yes"}
     checkpoint_path = _resolve_checkpoint(checkpoint)
+    multiplier_value = _validate_multiplier(multiplier)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         input_path = Path(temp_dir) / "input"
@@ -281,14 +320,30 @@ async def interpolate(
                 handle.write(chunk)
 
         video_id = uuid.uuid4().hex
-        output_path = Path(VIDEO_DIR) / f"{video_id}.mp4"
-        _run_atm_vfi(
-            input_path,
-            output_path,
-            normalized_type,
-            checkpoint_path,
-            combine_flag,
-        )
+        passes = int(math.log2(multiplier_value))
+        current_input = input_path
+
+        for pass_index in range(passes):
+            is_last = pass_index == passes - 1
+            if is_last:
+                output_path = Path(VIDEO_DIR) / f"{video_id}.mp4"
+            else:
+                output_path = Path(temp_dir) / f"pass_{pass_index + 1}.mp4"
+
+            _run_atm_vfi(
+                current_input,
+                output_path,
+                normalized_type,
+                checkpoint_path,
+                combine_flag if is_last else False,
+            )
+            current_input = output_path
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Interpolation output was not created.",
+            )
         metadata = _probe_video(output_path)
         video_volume.commit()
 
